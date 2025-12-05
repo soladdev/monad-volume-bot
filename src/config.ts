@@ -9,7 +9,9 @@ export const config = {
   masterPrivateKey: process.env.MASTER_PRIVATE_KEY || '',
   buyAmount: process.env.BUY_AMOUNT || '1',
   gasFee: 0.01, // Gas fee buffer per wallet (in MONAD)
+  delaySeconds: 3, // Delay between buy and sell (in seconds)
   chainId: 143,
+  explorerUrl: 'https://monad.socialscan.io/tx', // Blockchain explorer URL for transactions
   walletsFilePath: path.join(process.cwd(), 'src', 'wallets', 'wallets.json'),
   backupFolderPath: path.join(process.cwd(), 'src', 'wallets', 'backups'),
 };

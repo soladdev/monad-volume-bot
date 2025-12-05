@@ -587,8 +587,267 @@ export class WalletService {
 
   async runVolumeBot(): Promise<void> {
     Logger.section('Run Volume Bot');
-    Logger.warning('This feature will be implemented based on your instructions.');
-    Logger.info('Please provide the implementation details for volume bot.');
+
+    const walletsData = StorageManager.loadWallets();
+    if (!walletsData || walletsData.generatedWallets.length === 0) {
+      Logger.warning('No wallets found. Please generate accounts first.');
+      return;
+    }
+
+    // Ask for token address
+    const { tokenAddress } = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'tokenAddress',
+        message: 'Enter token address to trade:',
+        validate: (input) => {
+          if (!input.startsWith('0x') || input.length !== 42) {
+            return 'Please enter a valid token address';
+          }
+          return true;
+        },
+      },
+    ]);
+
+    const LENS = '0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea';
+    const buyAmount = parseFloat(config.buyAmount);
+
+    if (buyAmount <= 0) {
+      Logger.error('Buy amount must be greater than 0. Please check your config.');
+      return;
+    }
+
+    Logger.info(`Token Address: ${tokenAddress}`);
+    Logger.info(`Buy Amount: ${buyAmount} MONAD per wallet`);
+    Logger.info(`Cycles: Infinite`);
+    Logger.info(`Wallets: ${walletsData.generatedWallets.length}`);
+
+    const { confirm } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: 'Start volume bot?',
+        default: true,
+      },
+    ]);
+
+    if (!confirm) {
+      Logger.warning('Volume bot cancelled.');
+      return;
+    }
+
+    let cycleCount = 0;
+
+    try {
+      while (true) {
+        cycleCount++;
+        Logger.divider();
+        Logger.info(`\n🔄 Cycle ${cycleCount}`);
+
+        // BUY PHASE
+        Logger.info('\n📈 BUY PHASE');
+        const buySpinner = ora('Executing buys...').start();
+
+        const buyResults = await this.executeBuys(walletsData, tokenAddress, buyAmount, LENS);
+        buySpinner.stop();
+
+        let buySuccessCount = 0;
+        let buyFailCount = 0;
+        buyResults.forEach(result => {
+          if (result.success) {
+            buySuccessCount++;
+            const txLink = `${config.explorerUrl}/${result.txHash}`;
+            Logger.success(`✓ Wallet ${result.wallet} bought successfully`);
+            Logger.info(`  TX: ${txLink}`);
+          } else if (!result.skipped) {
+            buyFailCount++;
+            Logger.error(`✗ Wallet ${result.wallet} buy failed: ${result.error}`);
+          }
+        });
+        Logger.info(`Buy Results: Success: ${buySuccessCount} | Failed: ${buyFailCount}`);
+
+        // DELAY
+        if (config.delaySeconds > 0) {
+          Logger.info(`\n⏳ Waiting ${config.delaySeconds} seconds before sell...`);
+          await this.delay(config.delaySeconds * 1000);
+        }
+
+        // SELL PHASE
+        Logger.info('\n📉 SELL PHASE');
+        const sellSpinner = ora('Executing sells...').start();
+
+        const sellResults = await this.executeSells(walletsData, tokenAddress, LENS);
+        sellSpinner.stop();
+
+        let sellSuccessCount = 0;
+        let sellFailCount = 0;
+        sellResults.forEach(result => {
+          if (result.success) {
+            sellSuccessCount++;
+            const txLink = `${config.explorerUrl}/${result.txHash}`;
+            Logger.success(`✓ Wallet ${result.wallet} sold successfully`);
+            Logger.info(`  TX: ${txLink}`);
+          } else if (!result.skipped) {
+            sellFailCount++;
+            Logger.error(`✗ Wallet ${result.wallet} sell failed: ${result.error}`);
+          }
+        });
+        Logger.info(`Sell Results: Success: ${sellSuccessCount} | Failed: ${sellFailCount}`);
+
+        // Small delay before next cycle
+        Logger.info('\n⏳ Preparing for next cycle...');
+        await this.delay(2000);
+      }
+    } catch (error: any) {
+      Logger.error(`Volume bot error: ${error.message}`);
+    }
+  }
+
+  private async executeBuys(
+    walletsData: WalletsData,
+    tokenAddress: string,
+    buyAmount: number,
+    LENS: string
+  ): Promise<Array<{ success: boolean; wallet: number; txHash?: string; error?: string; skipped?: boolean }>> {
+    const buyPromises = walletsData.generatedWallets.map(async (walletInfo: WalletInfo, i: number) => {
+      try {
+        const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
+        const amountIn = ethers.parseEther(buyAmount.toString());
+        const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
+
+        // Step 1: Query Lens to get the correct router and expected output
+        const lensInterface = new ethers.Interface([
+          'function getAmountOut(address token, uint256 amountIn, bool isBuy) view returns (address router, uint256 amountOut)',
+        ]);
+        
+        const lensContract = new ethers.Contract(LENS, lensInterface, this.provider);
+        const [routerAddress, expectedOut] = await lensContract.getAmountOut(
+          tokenAddress,
+          amountIn,
+          true // isBuy
+        );
+
+        // Calculate min output with 1% slippage
+        const minOut = (expectedOut * 99n) / 100n;
+
+        // Step 2: Use the router returned by Lens
+        const buyInterface = new ethers.Interface([
+          'function buy(tuple(uint256 amountOutMin, address token, address to, uint256 deadline)) payable',
+        ]);
+
+        const buyParams = {
+          amountOutMin: minOut,
+          token: tokenAddress,
+          to: wallet.address,
+          deadline: deadline,
+        };
+
+        const data = buyInterface.encodeFunctionData('buy', [buyParams]);
+
+        const tx = await wallet.sendTransaction({
+          to: routerAddress,
+          data: data,
+          value: amountIn,
+          gasLimit: 1500000n,
+          maxFeePerGas: ethers.parseUnits('166', 'gwei'),
+          maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
+        });
+
+        await tx.wait();
+        return { success: true, wallet: i + 1, txHash: tx.hash };
+      } catch (error: any) {
+        return { success: false, wallet: i + 1, error: error.message };
+      }
+    });
+
+    return Promise.all(buyPromises);
+  }
+
+  private async executeSells(
+    walletsData: WalletsData,
+    tokenAddress: string,
+    LENS: string
+  ): Promise<Array<{ success: boolean; wallet: number; txHash?: string; error?: string; skipped?: boolean }>> {
+    const sellPromises = walletsData.generatedWallets.map(async (walletInfo: WalletInfo, i: number) => {
+      try {
+        const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
+
+        // Get token balance
+        const tokenContract = new ethers.Contract(
+          tokenAddress,
+          ['function balanceOf(address) view returns (uint256)'],
+          this.provider
+        );
+        const balance = await tokenContract.balanceOf(wallet.address);
+
+        if (balance === 0n) {
+          return { success: false, wallet: i + 1, skipped: true };
+        }
+
+        const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
+
+        // Step 1: Query Lens to get the correct router and expected MON output
+        const lensInterface = new ethers.Interface([
+          'function getAmountOut(address token, uint256 amountIn, bool isBuy) view returns (address router, uint256 amountOut)',
+        ]);
+        
+        const lensContract = new ethers.Contract(LENS, lensInterface, this.provider);
+        const [routerAddress, expectedMon] = await lensContract.getAmountOut(
+          tokenAddress,
+          balance,
+          false // isSell
+        );
+
+        // Calculate min output with 1% slippage
+        const minMon = (expectedMon * 99n) / 100n;
+
+        // Step 2: Approve tokens to the router
+        const approveInterface = new ethers.Interface([
+          'function approve(address spender, uint256 amount) returns (bool)',
+        ]);
+        const approveContract = new ethers.Contract(tokenAddress, approveInterface, wallet);
+        const approveTx = await approveContract.approve(routerAddress, balance, {
+          gasLimit: 100000n,
+          maxFeePerGas: ethers.parseUnits('166', 'gwei'),
+          maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
+        });
+        await approveTx.wait();
+
+        // Step 3: Execute sell
+        const sellInterface = new ethers.Interface([
+          'function sell(tuple(uint256 amountIn, uint256 amountOutMin, address token, address to, uint256 deadline))',
+        ]);
+
+        const sellParams = {
+          amountIn: balance,
+          amountOutMin: minMon,
+          token: tokenAddress,
+          to: wallet.address,
+          deadline: deadline,
+        };
+
+        const data = sellInterface.encodeFunctionData('sell', [sellParams]);
+
+        const tx = await wallet.sendTransaction({
+          to: routerAddress,
+          data: data,
+          gasLimit: 1500000n,
+          maxFeePerGas: ethers.parseUnits('166', 'gwei'),
+          maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
+        });
+
+        await tx.wait();
+        return { success: true, wallet: i + 1, txHash: tx.hash };
+      } catch (error: any) {
+        return { success: false, wallet: i + 1, error: error.message };
+      }
+    });
+
+    return Promise.all(sellPromises);
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 
