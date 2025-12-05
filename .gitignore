@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Wallets
+src/wallets/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
