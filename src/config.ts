@@ -7,7 +7,8 @@ dotenv.config();
 export const config = {
   rpcUrl: 'https://rpc3.monad.xyz',
   masterPrivateKey: process.env.MASTER_PRIVATE_KEY || '',
-  buyAmount: process.env.BUY_AMOUNT || '0.1',
+  buyAmount: process.env.BUY_AMOUNT || '1',
+  gasFee: 0.01, // Gas fee buffer per wallet (in MONAD)
   chainId: 143,
   walletsFilePath: path.join(process.cwd(), 'src', 'wallets', 'wallets.json'),
   backupFolderPath: path.join(process.cwd(), 'src', 'wallets', 'backups'),

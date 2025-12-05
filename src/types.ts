@@ -1,7 +1,6 @@
 export interface WalletInfo {
   address: string;
   privateKey: string;
-  buyAmount: string; // Amount in ETH/MONAD to use for buying
 }
 
 export interface WalletsData {

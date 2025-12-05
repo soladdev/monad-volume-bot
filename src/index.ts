@@ -6,7 +6,7 @@ import { WalletService } from './services/wallet.service';
 import { Logger } from './utils/logger';
 
 
-class MonadBundler {
+class MonadVolumeBot {
   private walletService: WalletService;
 
   constructor() {
@@ -17,8 +17,8 @@ class MonadBundler {
     console.clear();
     console.log(
       boxen(
-        chalk.cyan.bold(' NAD FUN BUNDLER \n\n') +
-        chalk.gray('Made by ') + chalk.magenta.bold('DEFIBITCH\n') +
+        chalk.cyan.bold(' MONAD VOLUME BOT \n\n') +
+        chalk.gray('Made by ') + chalk.magenta.bold('Vladmeer\n') +
         {
           padding: 1,
           margin: 1,
@@ -93,7 +93,7 @@ class MonadBundler {
         break;
       case 'exit':
         console.log(
-          boxen(chalk.cyan.bold('👋 Thank you for using Monad Bundler!'), {
+          boxen(chalk.cyan.bold('👋 Thank you for using Monad Volume Bot!'), {
             padding: 1,
             margin: 1,
             borderStyle: 'round',
@@ -144,8 +144,8 @@ async function main() {
       process.exit(1);
     }
 
-    const bundler = new MonadBundler();
-    await bundler.start();
+    const volumeBot = new MonadVolumeBot();
+    await volumeBot.start();
   } catch (error: any) {
     console.error(chalk.red('\n❌ Fatal Error:'), error.message);
     process.exit(1);

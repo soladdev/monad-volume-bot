@@ -51,7 +51,6 @@ export class WalletService {
         newWallets.push({
           address: wallet.address,
           privateKey: wallet.privateKey,
-          buyAmount: '0',
         });
       }
 
@@ -75,7 +74,6 @@ export class WalletService {
       newWallets.forEach((wallet, index) => {
         Logger.success(`Wallet ${index + 1}:`);
         Logger.address('  Address', wallet.address);
-        Logger.balance('  Buy Amount', wallet.buyAmount);
       });
       
       Logger.divider();
@@ -123,7 +121,6 @@ export class WalletService {
         console.log(chalk.cyan(`\nWallet ${i + 1}:`));
         Logger.address('  Address', wallet.address);
         Logger.balance('  Balance', balanceFormatted);
-        Logger.info(`  Buy Amount: ${wallet.buyAmount} MONAD`);
       }
 
       Logger.divider();
@@ -143,33 +140,32 @@ export class WalletService {
       return;
     }
 
-    // Calculate total amount needed
-    let totalBuyAmount = 0;
-    walletsData.generatedWallets.forEach((wallet) => {
-      totalBuyAmount += parseFloat(wallet.buyAmount);
-    });
-
-    Logger.info(`Total buy amount needed: ${totalBuyAmount.toFixed(6)} MONAD`);
-
-    const { bufferAmount } = await inquirer.prompt([
+    // Ask for fund amount
+    const { fundAmount } = await inquirer.prompt([
       {
         type: 'input',
-        name: 'bufferAmount',
-        message: 'Enter buffer amount (in MONAD) per wallet for gas fees:',
-        default: '0.01',
+        name: 'fundAmount',
+        message: `Enter amount (in MONAD) to fund each wallet:`,
+        default: config.buyAmount,
         validate: (input) => {
-          if (isNaN(parseFloat(input)) || parseFloat(input) < 0) {
-            return 'Please enter a valid non-negative number';
+          const amount = parseFloat(input);
+          if (isNaN(amount) || amount <= 0) {
+            return 'Please enter a valid positive number';
           }
           return true;
         },
       },
     ]);
 
-    const bufferPerWallet = parseFloat(bufferAmount);
-    const totalWithBuffer = totalBuyAmount + bufferPerWallet * walletsData.generatedWallets.length;
+    const amountPerWallet = parseFloat(fundAmount);
+    const bufferPerWallet = config.gasFee;
+    const amountWithBuffer = amountPerWallet + bufferPerWallet;
+    const totalWithBuffer = amountWithBuffer * walletsData.generatedWallets.length;
 
-    Logger.info(`Total with buffer: ${totalWithBuffer.toFixed(6)} MONAD`);
+    Logger.info(`Amount per wallet: ${amountPerWallet.toFixed(6)} MONAD`);
+    Logger.info(`Gas fee per wallet: ${bufferPerWallet.toFixed(6)} MONAD`);
+    Logger.info(`Total per wallet: ${amountWithBuffer.toFixed(6)} MONAD`);
+    Logger.info(`Total for all wallets: ${totalWithBuffer.toFixed(6)} MONAD`);
 
     // Check master wallet balance
     const masterBalance = await this.provider.getBalance(walletsData.masterWallet.address);
@@ -201,7 +197,7 @@ export class WalletService {
     try {
       for (let i = 0; i < walletsData.generatedWallets.length; i++) {
         const wallet = walletsData.generatedWallets[i];
-        const amountToSend = parseFloat(wallet.buyAmount) + bufferPerWallet;
+        const amountToSend = amountPerWallet + bufferPerWallet;
 
         spinner.text = `Funding wallet ${i + 1}/${walletsData.generatedWallets.length}...`;
 
@@ -355,7 +351,7 @@ export class WalletService {
 
     try {
       const buyPromises = walletsData.generatedWallets.map(async (walletInfo, i) => {
-        const buyAmount = parseFloat(walletInfo.buyAmount);
+        const buyAmount = parseFloat(config.buyAmount);
 
         if (buyAmount <= 0) {
           return { success: false, wallet: i + 1, skipped: true };
