@@ -224,8 +224,141 @@ export class WalletService {
     }
   }
 
-  async returnToMaster(): Promise<void> {
-    Logger.section('Return MONAD to Master Wallet');
+  private async getTokensInWallet(walletAddress: string): Promise<string[]> {
+    // ERC20 Transfer event signature
+    const transferEventSignature = 'Transfer(address,address,uint256)';
+    const transferTopic = ethers.id(transferEventSignature);
+    
+    // Get current block number
+    const currentBlock = await this.provider.getBlockNumber();
+    // Look back 10000 blocks (adjust as needed)
+    const fromBlock = Math.max(0, currentBlock - 10000);
+    
+    try {
+      // Query Transfer events where tokens were sent TO this wallet
+      const filter = {
+        topics: [
+          transferTopic,
+          null, // from address (any)
+          ethers.zeroPadValue(walletAddress, 32), // to address (this wallet)
+        ],
+        fromBlock,
+        toBlock: currentBlock,
+      };
+
+      const logs = await this.provider.getLogs(filter);
+      
+      // Extract unique token addresses from the logs
+      const tokenAddresses = new Set<string>();
+      logs.forEach(log => {
+        tokenAddresses.add(log.address);
+      });
+
+      // Check which tokens actually have balance > 0
+      const tokensWithBalance: string[] = [];
+      for (const tokenAddress of tokenAddresses) {
+        try {
+          const tokenContract = new ethers.Contract(
+            tokenAddress,
+            ['function balanceOf(address) view returns (uint256)'],
+            this.provider
+          );
+          const balance = await tokenContract.balanceOf(walletAddress);
+          if (balance > 0n) {
+            tokensWithBalance.push(tokenAddress);
+          }
+        } catch (error) {
+          // Skip invalid token contracts
+          continue;
+        }
+      }
+
+      return tokensWithBalance;
+    } catch (error) {
+      Logger.warning(`Error detecting tokens for wallet ${walletAddress}: ${error}`);
+      return [];
+    }
+  }
+
+  private async sellTokenFromWallet(
+    wallet: ethers.Wallet,
+    tokenAddress: string,
+    LENS: string
+  ): Promise<{ success: boolean; txHash?: string; error?: string }> {
+    try {
+      // Get token balance
+      const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ['function balanceOf(address) view returns (uint256)'],
+        this.provider
+      );
+      const balance = await tokenContract.balanceOf(wallet.address);
+
+      if (balance === 0n) {
+        return { success: false, error: 'No balance' };
+      }
+
+      const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
+
+      // Step 1: Query Lens to get the correct router and expected MON output
+      const lensInterface = new ethers.Interface([
+        'function getAmountOut(address token, uint256 amountIn, bool isBuy) view returns (address router, uint256 amountOut)',
+      ]);
+      
+      const lensContract = new ethers.Contract(LENS, lensInterface, this.provider);
+      const [routerAddress, expectedMon] = await lensContract.getAmountOut(
+        tokenAddress,
+        balance,
+        false // isSell
+      );
+
+      // Calculate min output with 1% slippage
+      const minMon = (expectedMon * 99n) / 100n;
+
+      // Step 2: Approve tokens to the router
+      const approveInterface = new ethers.Interface([
+        'function approve(address spender, uint256 amount) returns (bool)',
+      ]);
+      const approveContract = new ethers.Contract(tokenAddress, approveInterface, wallet);
+      const approveTx = await approveContract.approve(routerAddress, balance, {
+        gasLimit: 100000n,
+        maxFeePerGas: ethers.parseUnits('166', 'gwei'),
+        maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
+      });
+      await approveTx.wait();
+
+      // Step 3: Execute sell
+      const sellInterface = new ethers.Interface([
+        'function sell(tuple(uint256 amountIn, uint256 amountOutMin, address token, address to, uint256 deadline))',
+      ]);
+
+      const sellParams = {
+        amountIn: balance,
+        amountOutMin: minMon,
+        token: tokenAddress,
+        to: wallet.address,
+        deadline: deadline,
+      };
+
+      const data = sellInterface.encodeFunctionData('sell', [sellParams]);
+
+      const tx = await wallet.sendTransaction({
+        to: routerAddress,
+        data: data,
+        gasLimit: 1500000n,
+        maxFeePerGas: ethers.parseUnits('166', 'gwei'),
+        maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
+      });
+
+      await tx.wait();
+      return { success: true, txHash: tx.hash };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async refundToMaster(): Promise<void> {
+    Logger.section('Refund to Master Wallet');
 
     const walletsData = StorageManager.loadWallets();
     if (!walletsData || walletsData.generatedWallets.length === 0) {
@@ -237,7 +370,7 @@ export class WalletService {
       {
         type: 'confirm',
         name: 'confirm',
-        message: `Return all MONAD from ${walletsData.generatedWallets.length} wallets to master?`,
+        message: `Sell all tokens and refund all MONAD from ${walletsData.generatedWallets.length} wallets to master?`,
         default: true,
       },
     ]);
@@ -247,7 +380,61 @@ export class WalletService {
       return;
     }
 
-    const spinner = ora('Returning funds to master wallet...').start();
+    const LENS = '0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea';
+
+    // STEP 1: Detect and sell all tokens
+    Logger.info('\n📉 STEP 1: Detecting and selling all tokens...');
+    const detectSpinner = ora('Detecting tokens in wallets...').start();
+
+    let totalSellSuccess = 0;
+    let totalSellFail = 0;
+
+    try {
+      for (let i = 0; i < walletsData.generatedWallets.length; i++) {
+        const walletInfo = walletsData.generatedWallets[i];
+        const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
+
+        detectSpinner.text = `Detecting tokens in wallet ${i + 1}/${walletsData.generatedWallets.length}...`;
+        
+        const tokenAddresses = await this.getTokensInWallet(wallet.address);
+
+        if (tokenAddresses.length === 0) {
+          Logger.info(`Wallet ${i + 1}: No tokens found`);
+          continue;
+        }
+
+        Logger.info(`Wallet ${i + 1}: Found ${tokenAddresses.length} token(s)`);
+
+        // Sell each token
+        for (const tokenAddress of tokenAddresses) {
+          detectSpinner.text = `Selling tokens from wallet ${i + 1}/${walletsData.generatedWallets.length}...`;
+          
+          const result = await this.sellTokenFromWallet(wallet, tokenAddress, LENS);
+          
+          if (result.success) {
+            totalSellSuccess++;
+            const txLink = `${config.explorerUrl}/${result.txHash}`;
+            Logger.success(`✓ Wallet ${i + 1} sold token ${tokenAddress.substring(0, 10)}...`);
+            Logger.info(`  TX: ${txLink}`);
+          } else {
+            if (result.error !== 'No balance') {
+              totalSellFail++;
+              Logger.error(`✗ Wallet ${i + 1} failed to sell token ${tokenAddress.substring(0, 10)}...: ${result.error}`);
+            }
+          }
+        }
+      }
+
+      detectSpinner.succeed('Token detection and selling completed!');
+      Logger.info(`Sell Results: Success: ${totalSellSuccess} | Failed: ${totalSellFail}`);
+    } catch (error: any) {
+      detectSpinner.fail('Failed to detect or sell tokens');
+      Logger.error(error.message);
+    }
+
+    // STEP 2: Return all MONAD to master
+    Logger.info('\n💰 STEP 2: Returning MONAD to master wallet...');
+    const returnSpinner = ora('Returning funds to master wallet...').start();
     let totalReturned = 0;
 
     try {
@@ -255,7 +442,7 @@ export class WalletService {
         const walletInfo = walletsData.generatedWallets[i];
         const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
 
-        spinner.text = `Processing wallet ${i + 1}/${walletsData.generatedWallets.length}...`;
+        returnSpinner.text = `Processing wallet ${i + 1}/${walletsData.generatedWallets.length}...`;
 
         const balance = await this.provider.getBalance(wallet.address);
 
@@ -291,144 +478,17 @@ export class WalletService {
         const returned = ethers.formatEther(amountToSend);
         totalReturned += parseFloat(returned);
 
+        const txLink = `${config.explorerUrl}/${tx.hash}`;
         Logger.success(
           `✓ Returned ${parseFloat(returned).toFixed(6)} MONAD from wallet ${i + 1}`
         );
+        Logger.info(`  TX: ${txLink}`);
       }
 
-      spinner.succeed('All funds returned to master wallet!');
+      returnSpinner.succeed('All funds returned to master wallet!');
       Logger.success(`Total returned: ${totalReturned.toFixed(6)} MONAD`);
     } catch (error: any) {
-      spinner.fail('Failed to return funds');
-      Logger.error(error.message);
-    }
-  }
-
-  async bundleBuy(): Promise<void> {
-    Logger.section('Bundle Buy');
-
-    const walletsData = StorageManager.loadWallets();
-    if (!walletsData || walletsData.generatedWallets.length === 0) {
-      Logger.warning('No wallets found. Please generate accounts first.');
-      return;
-    }
-
-    // Ask for token address
-    const { tokenAddress } = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'tokenAddress',
-        message: 'Enter token address to buy:',
-        validate: (input) => {
-          if (!input.startsWith('0x') || input.length !== 42) {
-            return 'Please enter a valid token address';
-          }
-          return true;
-        },
-      },
-    ]);
-
-    // Nad.fun contracts: https://nad-fun.gitbook.io/nad.fun/for-developers/contracts-and-abi
-    const LENS = '0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea';
-    const BONDING_CURVE_ROUTER = '0x6F6B8F1a20703309951a5127c45B49b1CD981A22';
-    const DEX_ROUTER = '0x0B79d71AE99528D1dB24A4148b5f4F865cc2b137';
-
-    const { confirm } = await inquirer.prompt([
-      {
-        type: 'confirm',
-        name: 'confirm',
-        message: `Execute bundle buy for ${walletsData.generatedWallets.length} wallets?`,
-        default: true,
-      },
-    ]);
-
-    if (!confirm) {
-      Logger.warning('Bundle buy cancelled.');
-      return;
-    }
-
-    const spinner = ora('Executing bundle buy...').start();
-
-    try {
-      const buyPromises = walletsData.generatedWallets.map(async (walletInfo, i) => {
-        const buyAmount = parseFloat(config.buyAmount);
-
-        if (buyAmount <= 0) {
-          return { success: false, wallet: i + 1, skipped: true };
-        }
-
-        try {
-          const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
-          const amountIn = ethers.parseEther(buyAmount.toString());
-          const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
-
-          // Step 1: Query Lens to get the correct router and expected output
-          const lensInterface = new ethers.Interface([
-            'function getAmountOut(address token, uint256 amountIn, bool isBuy) view returns (address router, uint256 amountOut)',
-          ]);
-          
-          const lensContract = new ethers.Contract(LENS, lensInterface, this.provider);
-          const [routerAddress, expectedOut] = await lensContract.getAmountOut(
-            tokenAddress,
-            amountIn,
-            true // isBuy
-          );
-
-          // Calculate min output with 1% slippage
-          const minOut = (expectedOut * 99n) / 100n;
-
-          // Step 2: Use the router returned by Lens
-          const buyInterface = new ethers.Interface([
-            'function buy(tuple(uint256 amountOutMin, address token, address to, uint256 deadline)) payable',
-          ]);
-
-          const buyParams = {
-            amountOutMin: minOut,
-            token: tokenAddress,
-            to: wallet.address,
-            deadline: deadline,
-          };
-
-          const data = buyInterface.encodeFunctionData('buy', [buyParams]);
-
-          const tx = await wallet.sendTransaction({
-            to: routerAddress, // Use router from Lens
-            data: data,
-            value: amountIn,
-            gasLimit: 1500000n,
-            maxFeePerGas: ethers.parseUnits('166', 'gwei'),
-            maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
-          });
-
-          await tx.wait();
-          return { success: true, wallet: i + 1, buyAmount };
-        } catch (error: any) {
-          return { success: false, wallet: i + 1, error: error.message };
-        }
-      });
-
-      const results = await Promise.all(buyPromises);
-
-      spinner.succeed('Bundle buy completed!');
-
-      let successCount = 0;
-      let failCount = 0;
-
-      results.forEach(result => {
-        if (result.skipped) {
-          // Skip logging
-        } else if (result.success) {
-          successCount++;
-          Logger.success(`✓ Wallet ${result.wallet} bought successfully (${result.buyAmount} MONAD)`);
-        } else {
-          failCount++;
-          Logger.error(`✗ Wallet ${result.wallet} failed: ${result.error}`);
-        }
-      });
-
-      Logger.success(`Success: ${successCount} | Failed: ${failCount}`);
-    } catch (error: any) {
-      spinner.fail('Bundle buy failed');
+      returnSpinner.fail('Failed to return funds');
       Logger.error(error.message);
     }
   }
@@ -437,152 +497,6 @@ export class WalletService {
     Logger.section('Approve Tokens');
     Logger.warning('This feature will be implemented based on your instructions.');
     Logger.info('Please provide the implementation details for token approval.');
-  }
-
-  async bundleSell(): Promise<void> {
-    Logger.section('Bundle Sell');
-
-    const walletsData = StorageManager.loadWallets();
-    if (!walletsData || walletsData.generatedWallets.length === 0) {
-      Logger.warning('No wallets found. Please generate accounts first.');
-      return;
-    }
-
-    // Ask for token address
-    const { tokenAddress } = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'tokenAddress',
-        message: 'Enter token address to sell:',
-        validate: (input) => {
-          if (!input.startsWith('0x') || input.length !== 42) {
-            return 'Please enter a valid token address';
-          }
-          return true;
-        },
-      },
-    ]);
-
-    const LENS = '0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea';
-    const BONDING_CURVE_ROUTER = '0x6F6B8F1a20703309951a5127c45B49b1CD981A22';
-    const DEX_ROUTER = '0x0B79d71AE99528D1dB24A4148b5f4F865cc2b137';
-
-    const { confirm } = await inquirer.prompt([
-      {
-        type: 'confirm',
-        name: 'confirm',
-        message: `Execute bundle sell for ${walletsData.generatedWallets.length} wallets?`,
-        default: true,
-      },
-    ]);
-
-    if (!confirm) {
-      Logger.warning('Bundle sell cancelled.');
-      return;
-    }
-
-    const spinner = ora('Executing bundle sell...').start();
-
-    try {
-      const sellPromises = walletsData.generatedWallets.map(async (walletInfo, i) => {
-        try {
-          const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
-
-          // Get token balance
-          const tokenContract = new ethers.Contract(
-            tokenAddress,
-            ['function balanceOf(address) view returns (uint256)'],
-            this.provider
-          );
-          const balance = await tokenContract.balanceOf(wallet.address);
-
-          if (balance === 0n) {
-            return { success: false, wallet: i + 1, skipped: true };
-          }
-
-          const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
-
-          // Step 1: Query Lens to get the correct router and expected MON output
-          const lensInterface = new ethers.Interface([
-            'function getAmountOut(address token, uint256 amountIn, bool isBuy) view returns (address router, uint256 amountOut)',
-          ]);
-          
-          const lensContract = new ethers.Contract(LENS, lensInterface, this.provider);
-          const [routerAddress, expectedMon] = await lensContract.getAmountOut(
-            tokenAddress,
-            balance,
-            false // isSell
-          );
-
-          // Calculate min output with 1% slippage
-          const minMon = (expectedMon * 99n) / 100n;
-
-          // Step 2: Approve tokens to the router
-          const approveInterface = new ethers.Interface([
-            'function approve(address spender, uint256 amount) returns (bool)',
-          ]);
-          const approveContract = new ethers.Contract(tokenAddress, approveInterface, wallet);
-          const approveTx = await approveContract.approve(routerAddress, balance, {
-            gasLimit: 100000n,
-            maxFeePerGas: ethers.parseUnits('166', 'gwei'),
-            maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
-          });
-          await approveTx.wait();
-
-          // Step 3: Execute sell
-          const sellInterface = new ethers.Interface([
-            'function sell(tuple(uint256 amountIn, uint256 amountOutMin, address token, address to, uint256 deadline))',
-          ]);
-
-          const sellParams = {
-            amountIn: balance,
-            amountOutMin: minMon,
-            token: tokenAddress,
-            to: wallet.address,
-            deadline: deadline,
-          };
-
-          const data = sellInterface.encodeFunctionData('sell', [sellParams]);
-
-          const tx = await wallet.sendTransaction({
-            to: routerAddress,
-            data: data,
-            gasLimit: 1500000n,
-            maxFeePerGas: ethers.parseUnits('166', 'gwei'),
-            maxPriorityFeePerGas: ethers.parseUnits('166', 'gwei'),
-          });
-
-          await tx.wait();
-          return { success: true, wallet: i + 1 };
-        } catch (error: any) {
-          return { success: false, wallet: i + 1, error: error.message };
-        }
-      });
-
-      const results = await Promise.all(sellPromises);
-
-      spinner.succeed('Bundle sell completed!');
-
-      let successCount = 0;
-      let failCount = 0;
-
-      results.forEach(result => {
-        if (result.skipped) {
-          // Skip logging
-        } else if (result.success) {
-          successCount++;
-          Logger.success(`✓ Wallet ${result.wallet} sold successfully`);
-        } else {
-          failCount++;
-          Logger.error(`✗ Wallet ${result.wallet} failed: ${result.error}`);
-        }
-      });
-
-      Logger.success(`Success: ${successCount} | Failed: ${failCount}`);
-    } catch (error: any) {
-      spinner.fail('Bundle sell failed');
-      Logger.error(error.message);
-    }
   }
 
   async runVolumeBot(): Promise<void> {

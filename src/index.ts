@@ -18,7 +18,7 @@ class MonadVolumeBot {
     console.log(
       boxen(
         chalk.cyan.bold(' MONAD VOLUME BOT \n\n') +
-        chalk.gray('Made by ') + chalk.magenta.bold('Vladmeer\n') +
+        chalk.gray('Made by ') + chalk.magenta.bold('Vladmeer\n'),
         {
           padding: 1,
           margin: 1,
@@ -28,8 +28,6 @@ class MonadVolumeBot {
         }
       )
     );
-    console.log(chalk.gray(`Connected to: ${config.rpcUrl}`));
-    console.log(chalk.gray(`Chain ID: ${config.chainId}`));
     
     // Get and display master wallet balance
     const masterBalance = await this.walletService.getMasterBalance();
@@ -54,6 +52,10 @@ class MonadVolumeBot {
       {
         name: chalk.cyan('Run Volume Bot'),
         value: 'run_volume_bot',
+      },
+      {
+        name: chalk.cyan('Refund to Master'),
+        value: 'refund',
       },
       new inquirer.Separator(),
       {
@@ -90,6 +92,9 @@ class MonadVolumeBot {
         break;
       case 'run_volume_bot':
         await this.walletService.runVolumeBot();
+        break;
+      case 'refund':
+        await this.walletService.refundToMaster();
         break;
       case 'exit':
         console.log(
